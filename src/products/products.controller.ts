@@ -21,7 +21,7 @@ export class ProductsController {
 
   @Get(':field')
   findOne(@Param('field') field: string) {
-    return this.productsService.findOne(field);
+    return this.productsService.findOnePlan(field);
   }
 
   @Patch(':id')

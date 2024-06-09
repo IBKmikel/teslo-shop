@@ -2,11 +2,11 @@ import { BadRequestException, Injectable, InternalServerErrorException, Logger, 
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Product } from './entities/product.entity';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { PaginationDto } from 'src/common/dto/pagination.dto';
 import { validate as IsUUID} from 'uuid'
 import { isUUID } from 'class-validator';
+import { ProductImage, Product } from './entities';
 
 @Injectable()
 export class ProductsService {
@@ -14,24 +14,42 @@ export class ProductsService {
   constructor(
     @InjectRepository(Product)
     private readonly productRepository: Repository<Product>,
+    
+    @InjectRepository(ProductImage)
+    private readonly productimageRepository: Repository<ProductImage>,
+
+    private readonly dataSource: DataSource,
   ){}
   async create(createProductDto: CreateProductDto) {
     try {
-      const product = this.productRepository.create(createProductDto);
+      const { images = [], ...productDetails } = createProductDto;
+      const product = this.productRepository.create({
+        ...productDetails,
+        images: images.map( image => this.productimageRepository.create({ url: image}))
+      });
+
       await this.productRepository.save(product);
-      return product;
+      return {...product, images};
     } catch (error) {
       this.handleDBExceptions(error);
     }
   }
 
-  findAll(paginationDto: PaginationDto) {
+  async findAll(paginationDto: PaginationDto) {
     const { limit = 10, offset = 0 } = paginationDto;
-    return this.productRepository.find({
+    const products = await this.productRepository.find({
       take: limit,
-      skip: offset
+      skip: offset,
       //TODO: Relaciones
+      relations: {
+        images: true
+      }
     });
+
+    return products.map(({images, ...rest})=>({
+      ...rest,
+      images: images.map( img => img.url)
+    }))
   }
 
   async findOne(field: string) {
@@ -41,12 +59,14 @@ export class ProductsService {
       product = await this.productRepository.findOneBy({id: field})
     }else{
       // product = await this.productRepository.findOneBy({slug: field})  
-      const queryBuilder = this.productRepository.createQueryBuilder();
+      const queryBuilder = this.productRepository.createQueryBuilder('prod');
       product = await queryBuilder
                     .where(`UPPER(title) =:title or slug =:slug`,{
                       title: field.toUpperCase(),
                       slug: field.toLowerCase()
-                    }).getOne();
+                    })
+                    .leftJoinAndSelect('prod.images', 'prodImages')
+                    .getOne();
     }
 
     if(!product)
@@ -55,19 +75,50 @@ export class ProductsService {
     return product;
   }
 
+  async findOnePlan(field: string){
+    const { images = [], ...rest } = await this.findOne(field);
+    return{
+      ...rest,
+      images: images.map(img => img.url)
+    };
+  }
+
   async update(id: string, updateProductDto: UpdateProductDto) {
+
+    const { images, ...toUpdate } = updateProductDto;
+
     const product = await this.productRepository.preload({
       id,
-      ...updateProductDto
+      ...toUpdate,
     });
 
     if(!product)
       throw new NotFoundException(`Product with id: ${id}, not found.`);
     
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
     try {
-      await this.productRepository.save(product);
-      return product; 
+      if(images){
+        await queryRunner.manager.delete(ProductImage, { product: { id } });
+
+        product.images = images.map(
+          img => this.productimageRepository.create({url: img})
+        )
+      }
+
+      await queryRunner.manager.save(product);
+
+      // await this.productRepository.save(product);
+      await queryRunner.commitTransaction();
+      await queryRunner.release();
+
+      return this.findOnePlan(id);
     } catch (error) {
+      await queryRunner.rollbackTransaction();
+      await queryRunner.release();
+
       this.handleDBExceptions(error);
     }
   }
